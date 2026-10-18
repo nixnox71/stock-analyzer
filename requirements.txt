@@ -4,3 +4,4 @@ requests
 finance-datareader
 plotly
 pykrx
+setuptools

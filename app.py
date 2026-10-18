@@ -20,7 +20,7 @@ FAV_FILE = "favorites.json"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
 
-# 관심 종목 파일 저장/불러오기 로직 (새로고침 해도 유지됨)
+# 관심 종목 파일 저장/불러오기 로직
 if "favorites" not in st.session_state:
     if os.path.exists(FAV_FILE):
         try:
@@ -133,17 +133,18 @@ def get_investor_trends_detail(code):
 def load_corp_codes(api_key):
     if not api_key:
         return pd.DataFrame()
+    api_key = api_key.strip()
     url = f"{DART_BASE}/corpCode.xml?crtfc_key={api_key}"
     try:
         r = requests.get(url, timeout=20)
-        r.raise_for_status()
-        if not r.content.startswith(b'PK'):
-            return "API_KEY_ERROR"
+        if r.status_code != 200: return pd.DataFrame()
+        if not r.content.startswith(b'PK'): return "API_KEY_ERROR"
+        
         with zipfile.ZipFile(io.BytesIO(r.content)) as z:
             xml_name = next((n for n in z.namelist() if n.lower().endswith(".xml")), None)
-            if not xml_name:
-                return pd.DataFrame()
+            if not xml_name: return pd.DataFrame()
             root = ET.fromstring(z.read(xml_name))
+            
         rows = [{"corp_code": (item.findtext("corp_code") or "").strip(),
                  "stock_code": (item.findtext("stock_code") or "").strip()} 
                 for item in root.findall("list")]
@@ -152,22 +153,23 @@ def load_corp_codes(api_key):
         return pd.DataFrame()
 
 def get_recent_disclosures(code, api_key):
-    if not api_key:
-        return None, "사이드바에 OpenDART API 키를 입력하면 최신 공시 원문을 확인할 수 있습니다."
+    if not api_key: return None, "사이드바에 OpenDART API 키를 입력하면 최신 공시 원문을 확인할 수 있습니다."
     try:
         corp_df = load_corp_codes(api_key)
+        # 안전장치 추가: DART 응답이 텅 비었을 때 방어
         if isinstance(corp_df, str) and corp_df == "API_KEY_ERROR":
             return None, "입력하신 API 키가 유효하지 않습니다."
-        if corp_df.empty: return None, "DART 기업코드 목록을 불러오지 못했습니다."
-        
+        if corp_df.empty: 
+            return None, "DART 기업코드 목록을 불러오지 못했습니다. (우측 하단 'Clear cache' 클릭 요망)"
+            
         hit = corp_df[corp_df["stock_code"].astype(str).str.zfill(6) == str(code).zfill(6)]
-        if hit.empty: return None, "해당 종목의 기업코드를 찾지 못했습니다."
+        if hit.empty: return None, "해당 종목의 DART 기업코드를 찾지 못했습니다."
         
         corp_code = hit.iloc[0]["corp_code"]
         end_de = datetime.now().strftime("%Y%m%d")
         bgn_de = (datetime.now() - timedelta(days=90)).strftime("%Y%m%d")
         url = f"{DART_BASE}/list.json"
-        j = requests.get(url, params={"crtfc_key": api_key, "corp_code": corp_code, "bgn_de": bgn_de, "end_de": end_de, "page_count": "6"}, timeout=15).json()
+        j = requests.get(url, params={"crtfc_key": api_key.strip(), "corp_code": corp_code, "bgn_de": bgn_de, "end_de": end_de, "page_count": "6"}, timeout=15).json()
         if j.get("status") == "000" and j.get("list"):
             df = pd.DataFrame(j["list"])
             df["link"] = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + df["rcept_no"]
@@ -181,11 +183,17 @@ def get_dart_financials(code, api_key):
     if not api_key: return None, "OpenDART API 키를 사이드바에 입력하세요."
     try:
         corp_df = load_corp_codes(api_key)
+        # 안전장치 추가
+        if isinstance(corp_df, str) and corp_df == "API_KEY_ERROR":
+            return None, "유효하지 않은 API 키입니다."
+        if corp_df.empty: 
+            return None, "DART 기업코드 목록을 불러오지 못했습니다. (우측 하단 'Clear cache' 클릭 요망)"
+            
         hit = corp_df[corp_df["stock_code"].astype(str).str.zfill(6) == str(code).zfill(6)]
-        if hit.empty: return None, "종목코드를 찾지 못했습니다."
+        if hit.empty: return None, "해당 종목의 DART 기업코드를 찾지 못했습니다."
+        
         corp_code = hit.iloc[0]["corp_code"]
         curr_year = datetime.now().year
-        
         ordered_periods = []
         for y in range(curr_year, curr_year - 3, -1):
             ordered_periods.extend([(str(y), "11011", f"{y}년 연간"), (str(y), "11014", f"{y}년 3분기"), (str(y), "11012", f"{y}년 반기"), (str(y), "11013", f"{y}년 1분기")])
@@ -195,7 +203,7 @@ def get_dart_financials(code, api_key):
             if len(collected_data) >= 3: break
             try:
                 url = f"{DART_BASE}/fnlttSinglAcntAll.json"
-                params = {"crtfc_key": api_key, "corp_code": corp_code, "bsns_year": y, "reprt_code": reprt_code, "fs_div": "CFS"}
+                params = {"crtfc_key": api_key.strip(), "corp_code": corp_code, "bsns_year": y, "reprt_code": reprt_code, "fs_div": "CFS"}
                 res = requests.get(url, params=params, timeout=5).json()
                 if res.get("status") == "000" and res.get("list"):
                     collected_data[col_name] = res["list"]
@@ -223,8 +231,7 @@ def get_dart_financials(code, api_key):
                 found = raw_df[raw_df["account_nm"].fillna("").apply(lambda x: any(k == x.strip() or k in x for k in keywords))]
                 if not found.empty:
                     val_str = found.iloc[0].get("thstrm_amount", "")
-                    try:
-                        disp = f"{float(str(val_str).replace(',', '').strip()) / 100000000:,.1f} 억원"
+                    try: disp = f"{float(str(val_str).replace(',', '').strip()) / 100000000:,.1f} 억원"
                     except: disp = "-"
                     row_dict[c_name] = disp
                 else: row_dict[c_name] = "-"
@@ -293,7 +300,7 @@ if menu == "1. 종합 주식/ETF 분석":
         else:
             st.session_state["favorites"].remove(code)
             st.info("해제 완료.")
-        save_favorites() # 클릭 시 파일에 영구 저장
+        save_favorites() 
 
     # 뉴스
     news_df = get_news(company)
@@ -432,7 +439,7 @@ elif menu == "5. 💡 AI 추천 종목 스크리닝":
         else: st.warning("조건을 완벽히 만족하는 종목이 없습니다.")
 
 # ==========================================
-# 6. 정밀 기술적 보조지표 차트 (대폭 업그레이드)
+# 6. 정밀 기술적 보조지표 차트
 # ==========================================
 elif menu == "6. 📉 HTS급 보조지표 차트":
     st.title("📉 HTS급 정밀 기술적 분석 차트")
@@ -445,52 +452,32 @@ elif menu == "6. 📉 HTS급 보조지표 차트":
         t_code = str(t_match.iloc[0]["Code"]).zfill(6)
         t_name = t_match.iloc[0]["Name"]
         
-        # 최근 6개월 데이터 로드
         df_p = load_price(t_code, (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"))
         if df_p is not None and not df_p.empty:
             
-            # 1. 볼린저 밴드 계산
             df_p["MA20"] = df_p["Close"].rolling(20).mean()
             df_p["STD"] = df_p["Close"].rolling(20).std()
             df_p["Upper"] = df_p["MA20"] + (df_p["STD"] * 2)
             df_p["Lower"] = df_p["MA20"] - (df_p["STD"] * 2)
             
-            # 2. 피보나치 되돌림 계산 (최고점/최저점 기준)
-            max_p = df_p['High'].max()
-            min_p = df_p['Low'].min()
+            max_p, min_p = df_p['High'].max(), df_p['Low'].min()
             diff = max_p - min_p
-            fib_levels = {
-                "0.0% (고점)": max_p,
-                "23.6%": max_p - diff * 0.236,
-                "38.2%": max_p - diff * 0.382,
-                "50.0% (절반)": max_p - diff * 0.5,
-                "61.8%": max_p - diff * 0.618,
-                "100.0% (저점)": min_p
-            }
+            fib_levels = {"0.0% (고점)": max_p, "23.6%": max_p - diff * 0.236, "38.2%": max_p - diff * 0.382, "50.0% (절반)": max_p - diff * 0.5, "61.8%": max_p - diff * 0.618, "100.0% (저점)": min_p}
             
-            # 3. RSI 계산 (14일 기준)
             delta = df_p["Close"].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            df_p["RSI"] = 100 - (100 / (1 + rs))
+            df_p["RSI"] = 100 - (100 / (1 + (gain / loss)))
             
-            # 4. 차트 그리기 (2단 분리: 위쪽 캔들/볼린저/피보나치, 아래쪽 RSI)
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
-            
-            # [Row 1] 캔들 차트
             fig.add_trace(go.Candlestick(x=df_p.index, open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'], name="주가"), row=1, col=1)
-            
-            # [Row 1] 볼린저 밴드 영역 (시각적 강조)
             fig.add_trace(go.Scatter(x=df_p.index, y=df_p['Upper'], name="볼린저 상단", line=dict(color="rgba(173, 216, 230, 0.5)", dash="dash")), row=1, col=1)
             fig.add_trace(go.Scatter(x=df_p.index, y=df_p['Lower'], name="볼린저 하단", fill='tonexty', fillcolor="rgba(173, 216, 230, 0.1)", line=dict(color="rgba(173, 216, 230, 0.5)", dash="dash")), row=1, col=1)
             
-            # [Row 1] 피보나치 되돌림 선 
             fib_colors = ["red", "orange", "yellow", "green", "blue", "purple"]
             for i, (label, val) in enumerate(fib_levels.items()):
                 fig.add_hline(y=val, line_dash="dot", line_color=fib_colors[i], annotation_text=label, annotation_position="top left", row=1, col=1)
             
-            # [Row 2] RSI 지표
             fig.add_trace(go.Scatter(x=df_p.index, y=df_p['RSI'], name="RSI (14일)", line=dict(color="purple")), row=2, col=1)
             fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="과매수 (70)", row=2, col=1)
             fig.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="과매도 (30)", row=2, col=1)

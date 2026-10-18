@@ -20,7 +20,14 @@ FAV_FILE = "favorites.json"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
 
-# 관심 종목 파일 저장/불러오기 로직
+# ==========================================
+# 세션 상태(Session State) 초기화 (메뉴 이동 및 관심종목용)
+# ==========================================
+if "current_menu" not in st.session_state:
+    st.session_state.current_menu = "1. 종합 주식/ETF 분석"
+if "target_stock" not in st.session_state:
+    st.session_state.target_stock = ""
+
 if "favorites" not in st.session_state:
     if os.path.exists(FAV_FILE):
         try:
@@ -35,19 +42,27 @@ def save_favorites():
     with open(FAV_FILE, "w") as f:
         json.dump(st.session_state["favorites"], f)
 
+# 사이드바 메뉴 설정
+menu_options = [
+    "1. 종합 주식/ETF 분석", 
+    "2. ⭐ 관심 종목 (즐겨찾기)", 
+    "3. 🔥 시가총액 상위 20 수급 동향",
+    "4. 🚀 당일 상승률 상위 20",
+    "5. 💡 AI 추천 종목 스크리닝",
+    "6. 📉 HTS급 보조지표 차트"
+]
+
 with st.sidebar:
     st.header("🛠️ 분석 메뉴")
-    menu = st.radio(
-        "이동할 메뉴를 선택하세요",
-        [
-            "1. 종합 주식/ETF 분석", 
-            "2. ⭐ 관심 종목 (즐겨찾기)", 
-            "3. 🔥 시가총액 상위 20 수급 동향",
-            "4. 🚀 당일 상승률 상위 20",
-            "5. 💡 AI 추천 종목 스크리닝",
-            "6. 📉 HTS급 보조지표 차트"
-        ]
-    )
+    selected_idx = menu_options.index(st.session_state.current_menu) if st.session_state.current_menu in menu_options else 0
+    menu = st.radio("이동할 메뉴를 선택하세요", menu_options, index=selected_idx)
+    
+    # 메뉴를 직접 클릭해서 이동했을 때의 처리
+    if menu != st.session_state.current_menu:
+        st.session_state.current_menu = menu
+        st.session_state.target_stock = "" # 다른 메뉴로 갈 때는 타겟 초기화
+        st.rerun()
+        
     st.divider()
     st.header("⚙️ 설정")
     dart_key = st.text_input(
@@ -56,7 +71,6 @@ with st.sidebar:
         type="password",
         help="공시 재무제표 및 최근 공시 원문을 보려면 OpenDART API 키를 입력하세요."
     )
-    st.markdown("[OpenDART API 키 발급](https://opendart.fss.or.kr/)")
     st.caption("데이터 출처: FinanceDataReader, Naver API, DART")
     st.divider()
     st.markdown("**주의:** 본 프로그램은 정보 제공용이며 투자 권유가 아닙니다.")
@@ -116,151 +130,116 @@ def get_investor_trends_detail(code):
                 df = pd.DataFrame(items)
                 inst_col = next((c for c in df.columns if any(x in c.lower() for x in ["organ", "inst"])), None)
                 fore_col = next((c for c in df.columns if any(x in c.lower() for x in ["frgn", "foreigner"])), None)
-                
                 if inst_col and fore_col:
                     df[inst_col] = pd.to_numeric(df[inst_col].astype(str).str.replace(r'[^\d\-]', '', regex=True), errors="coerce").fillna(0)
                     df[fore_col] = pd.to_numeric(df[fore_col].astype(str).str.replace(r'[^\d\-]', '', regex=True), errors="coerce").fillna(0)
-                    return {
-                        "기관_1일": df[inst_col].iloc[0] if len(df) > 0 else 0,
-                        "외국인_1일": df[fore_col].iloc[0] if len(df) > 0 else 0,
-                        "기관_5일": df[inst_col].head(5).sum() if len(df) > 0 else 0,
-                        "외국인_5일": df[fore_col].head(5).sum() if len(df) > 0 else 0
-                    }
+                    return {"기관_1일": df[inst_col].iloc[0] if len(df) > 0 else 0, "외국인_1일": df[fore_col].iloc[0] if len(df) > 0 else 0, "기관_5일": df[inst_col].head(5).sum() if len(df) > 0 else 0, "외국인_5일": df[fore_col].head(5).sum() if len(df) > 0 else 0}
     except: pass
     return {"기관_1일": 0, "외국인_1일": 0, "기관_5일": 0, "외국인_5일": 0}
 
+# 사용자 수동 캐시 삭제 방지를 위한 DART 자동화 로직
 @st.cache_data(ttl=86400, show_spinner=False)
-def load_corp_codes(api_key):
-    if not api_key:
-        return pd.DataFrame()
-    api_key = api_key.strip()
-    url = f"{DART_BASE}/corpCode.xml?crtfc_key={api_key}"
+def _fetch_corp_codes(api_key):
+    url = f"{DART_BASE}/corpCode.xml?crtfc_key={api_key.strip()}"
     try:
-        r = requests.get(url, timeout=20)
-        if r.status_code != 200: return pd.DataFrame()
-        if not r.content.startswith(b'PK'): return "API_KEY_ERROR"
-        
-        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-            xml_name = next((n for n in z.namelist() if n.lower().endswith(".xml")), None)
-            if not xml_name: return pd.DataFrame()
-            root = ET.fromstring(z.read(xml_name))
-            
-        rows = [{"corp_code": (item.findtext("corp_code") or "").strip(),
-                 "stock_code": (item.findtext("stock_code") or "").strip()} 
-                for item in root.findall("list")]
-        return pd.DataFrame(rows)
-    except:
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200 and r.content.startswith(b'PK'):
+            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                xml_name = next((n for n in z.namelist() if n.lower().endswith(".xml")), None)
+                if xml_name:
+                    root = ET.fromstring(z.read(xml_name))
+                    return pd.DataFrame([{"corp_code": (item.findtext("corp_code") or "").strip(), "stock_code": (item.findtext("stock_code") or "").strip()} for item in root.findall("list")])
+    except: pass
+    return None
+
+def load_corp_codes(api_key):
+    if not api_key: return pd.DataFrame()
+    df = _fetch_corp_codes(api_key)
+    # 에러나 빈 값이 반환되면 멍청하게 캐시하지 않고 즉시 지워버림 (자동 복구)
+    if df is None or df.empty:
+        _fetch_corp_codes.clear() 
         return pd.DataFrame()
+    return df
 
 def get_recent_disclosures(code, api_key):
-    if not api_key: return None, "사이드바에 OpenDART API 키를 입력하면 최신 공시 원문을 확인할 수 있습니다."
+    if not api_key: return None, "OpenDART API 키를 입력하세요."
+    corp_df = load_corp_codes(api_key)
+    if corp_df.empty: return None, "DART 기업코드 통신 지연. 잠시 후 다시 시도해 주세요."
+    hit = corp_df[corp_df["stock_code"].astype(str).str.zfill(6) == str(code).zfill(6)]
+    if hit.empty: return None, "DART 공시 대상 기업이 아닙니다."
+    
+    corp_code = hit.iloc[0]["corp_code"]
+    end_de = datetime.now().strftime("%Y%m%d")
+    bgn_de = (datetime.now() - timedelta(days=90)).strftime("%Y%m%d")
     try:
-        corp_df = load_corp_codes(api_key)
-        # 안전장치 추가: DART 응답이 텅 비었을 때 방어
-        if isinstance(corp_df, str) and corp_df == "API_KEY_ERROR":
-            return None, "입력하신 API 키가 유효하지 않습니다."
-        if corp_df.empty: 
-            return None, "DART 기업코드 목록을 불러오지 못했습니다. (우측 하단 'Clear cache' 클릭 요망)"
-            
-        hit = corp_df[corp_df["stock_code"].astype(str).str.zfill(6) == str(code).zfill(6)]
-        if hit.empty: return None, "해당 종목의 DART 기업코드를 찾지 못했습니다."
-        
-        corp_code = hit.iloc[0]["corp_code"]
-        end_de = datetime.now().strftime("%Y%m%d")
-        bgn_de = (datetime.now() - timedelta(days=90)).strftime("%Y%m%d")
-        url = f"{DART_BASE}/list.json"
-        j = requests.get(url, params={"crtfc_key": api_key.strip(), "corp_code": corp_code, "bgn_de": bgn_de, "end_de": end_de, "page_count": "6"}, timeout=15).json()
+        j = requests.get(f"{DART_BASE}/list.json", params={"crtfc_key": api_key.strip(), "corp_code": corp_code, "bgn_de": bgn_de, "end_de": end_de, "page_count": "6"}, timeout=10).json()
         if j.get("status") == "000" and j.get("list"):
             df = pd.DataFrame(j["list"])
             df["link"] = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo=" + df["rcept_no"]
             return df[["rcept_dt", "report_nm", "link"]], None
         return None, "최근 3개월 내 주요 공시가 없습니다."
-    except Exception as e:
-        return None, f"공시 조회 오류: {e}"
+    except: return None, "공시 서버 응답 지연"
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_dart_financials(code, api_key):
-    if not api_key: return None, "OpenDART API 키를 사이드바에 입력하세요."
-    try:
-        corp_df = load_corp_codes(api_key)
-        # 안전장치 추가
-        if isinstance(corp_df, str) and corp_df == "API_KEY_ERROR":
-            return None, "유효하지 않은 API 키입니다."
-        if corp_df.empty: 
-            return None, "DART 기업코드 목록을 불러오지 못했습니다. (우측 하단 'Clear cache' 클릭 요망)"
-            
-        hit = corp_df[corp_df["stock_code"].astype(str).str.zfill(6) == str(code).zfill(6)]
-        if hit.empty: return None, "해당 종목의 DART 기업코드를 찾지 못했습니다."
+    if not api_key: return None, "OpenDART API 키를 입력하세요."
+    corp_df = load_corp_codes(api_key)
+    if corp_df.empty: return None, "데이터를 불러오는 중입니다. 잠시 후 재시도하세요."
+    hit = corp_df[corp_df["stock_code"].astype(str).str.zfill(6) == str(code).zfill(6)]
+    if hit.empty: return None, "공시 대상이 아닙니다."
+    
+    corp_code = hit.iloc[0]["corp_code"]
+    curr_year = datetime.now().year
+    ordered_periods = []
+    for y in range(curr_year, curr_year - 3, -1):
+        ordered_periods.extend([(str(y), "11011", f"{y}년 연간"), (str(y), "11014", f"{y}년 3분기"), (str(y), "11012", f"{y}년 반기"), (str(y), "11013", f"{y}년 1분기")])
         
-        corp_code = hit.iloc[0]["corp_code"]
-        curr_year = datetime.now().year
-        ordered_periods = []
-        for y in range(curr_year, curr_year - 3, -1):
-            ordered_periods.extend([(str(y), "11011", f"{y}년 연간"), (str(y), "11014", f"{y}년 3분기"), (str(y), "11012", f"{y}년 반기"), (str(y), "11013", f"{y}년 1분기")])
+    collected_data = {}
+    for y, reprt_code, col_name in ordered_periods:
+        if len(collected_data) >= 3: break
+        try:
+            url = f"{DART_BASE}/fnlttSinglAcntAll.json"
+            params = {"crtfc_key": api_key.strip(), "corp_code": corp_code, "bsns_year": y, "reprt_code": reprt_code, "fs_div": "CFS"}
+            res = requests.get(url, params=params, timeout=5).json()
+            if res.get("status") == "000" and res.get("list"):
+                collected_data[col_name] = res["list"]
+                continue
+            params["fs_div"] = "OFS"
+            res_ofs = requests.get(url, params=params, timeout=5).json()
+            if res_ofs.get("status") == "000" and res_ofs.get("list"):
+                collected_data[col_name] = res_ofs["list"]
+        except: continue
             
-        collected_data = {}
-        for y, reprt_code, col_name in ordered_periods:
-            if len(collected_data) >= 3: break
-            try:
-                url = f"{DART_BASE}/fnlttSinglAcntAll.json"
-                params = {"crtfc_key": api_key.strip(), "corp_code": corp_code, "bsns_year": y, "reprt_code": reprt_code, "fs_div": "CFS"}
-                res = requests.get(url, params=params, timeout=5).json()
-                if res.get("status") == "000" and res.get("list"):
-                    collected_data[col_name] = res["list"]
-                    continue
-                params["fs_div"] = "OFS"
-                res_ofs = requests.get(url, params=params, timeout=5).json()
-                if res_ofs.get("status") == "000" and res_ofs.get("list"):
-                    collected_data[col_name] = res_ofs["list"]
-            except: continue
-                
-        if not collected_data: return None, "재무제표 데이터를 조회하지 못했습니다."
-            
-        patterns = {
-            "매출액": ["매출액", "수익(매출액)", "영업수익"], "영업이익": ["영업이익", "영업이익(손실)"],
-            "당기순이익": ["당기순이익", "당기순이익(손실)"], "자산총계": ["자산총계"],
-            "부채총계": ["부채총계"], "자본총계": ["자본총계"]
-        }
+    if not collected_data: return None, "재무제표가 접수되지 않았습니다."
         
-        records = []
-        col_names = list(collected_data.keys())
-        for label, keywords in patterns.items():
-            row_dict = {"주요 계정": label}
-            for c_name in col_names:
-                raw_df = pd.DataFrame(collected_data[c_name])
-                found = raw_df[raw_df["account_nm"].fillna("").apply(lambda x: any(k == x.strip() or k in x for k in keywords))]
-                if not found.empty:
-                    val_str = found.iloc[0].get("thstrm_amount", "")
-                    try: disp = f"{float(str(val_str).replace(',', '').strip()) / 100000000:,.1f} 억원"
-                    except: disp = "-"
-                    row_dict[c_name] = disp
-                else: row_dict[c_name] = "-"
-            records.append(row_dict)
-            
-        if records: return pd.DataFrame(records)[["주요 계정"] + col_names], f"최근 3개 실적: {' · '.join(col_names)}"
-        return None, "재무 항목 정규화 실패"
-    except Exception as e:
-        return None, f"파싱 실패: {e}"
+    patterns = {"매출액": ["매출액", "수익(매출액)", "영업수익"], "영업이익": ["영업이익", "영업이익(손실)"], "당기순이익": ["당기순이익", "당기순이익(손실)"], "자산총계": ["자산총계"], "부채총계": ["부채총계"], "자본총계": ["자본총계"]}
+    records = []
+    col_names = list(collected_data.keys())
+    for label, keywords in patterns.items():
+        row_dict = {"주요 계정": label}
+        for c_name in col_names:
+            raw_df = pd.DataFrame(collected_data[c_name])
+            found = raw_df[raw_df["account_nm"].fillna("").apply(lambda x: any(k == x.strip() or k in x for k in keywords))]
+            if not found.empty:
+                try: row_dict[c_name] = f"{float(str(found.iloc[0].get('thstrm_amount', '')).replace(',', '').strip()) / 100000000:,.1f} 억원"
+                except: row_dict[c_name] = "-"
+            else: row_dict[c_name] = "-"
+        records.append(row_dict)
+    return pd.DataFrame(records)[["주요 계정"] + col_names], f"최근 3개 실적: {' · '.join(col_names)}"
 
 def get_news(company):
-    since = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
     query = quote(f'"{company}" 주식')
-    url = f"https://news.google.com/rss/search?q={query}+after:{since}&hl=ko&gl=KR&ceid=KR:ko"
+    url = f"https://news.google.com/rss/search?q={query}+after:{(datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')}&hl=ko&gl=KR&ceid=KR:ko"
     try:
-        resp = requests.get(url, timeout=15)
+        resp = requests.get(url, timeout=10)
         root = ET.fromstring(resp.content)
         rows = []
-        for item in root.findall(".//item"):
+        for item in root.findall(".//item")[:15]:
             title = item.findtext("title") or ""
-            link = item.findtext("link") or ""
-            pub = item.findtext("pubDate") or ""
-            source = item.findtext("source") or ""
-            title_l = title.lower()
-            p = sum(k in title_l for k in ["흑자", "상승", "급등", "수주", "계약", "호실적", "배당"])
-            n = sum(k in title_l for k in ["적자", "하락", "급락", "소송", "횡령", "유상증자", "부진"])
-            sentiment = "호재 가능성" if p > n else ("악재 가능성" if n > p else "중립/추가 확인")
-            rows.append({"날짜": pub[5:16], "제목": title, "출처": source, "분류(자동)": sentiment, "링크": link})
-        return pd.DataFrame(rows).drop_duplicates(subset=["제목"]).head(15)
+            p = sum(k in title.lower() for k in ["흑자", "상승", "급등", "수주", "계약", "호실적", "배당"])
+            n = sum(k in title.lower() for k in ["적자", "하락", "급락", "소송", "횡령", "유상증자", "부진"])
+            rows.append({"날짜": (item.findtext("pubDate") or "")[5:16], "제목": title, "출처": item.findtext("source") or "", "분류(자동)": "호재 가능성" if p > n else ("악재 가능성" if n > p else "중립/추가 확인"), "링크": item.findtext("link") or ""})
+        return pd.DataFrame(rows).drop_duplicates(subset=["제목"])
     except: return pd.DataFrame()
 
 def won(v): return f"{float(v):,.0f}원" if pd.notna(v) else "자료 없음"
@@ -273,11 +252,13 @@ if listings.empty:
 # ==========================================
 # 1. 종합 주식/ETF 분석
 # ==========================================
-if menu == "1. 종합 주식/ETF 분석":
+if st.session_state.current_menu == "1. 종합 주식/ETF 분석":
     st.title("📈 국내 주식 및 ETF 종합 분석기")
     with st.form("search_form"):
         col1, col2 = st.columns([3, 1])
-        query = col1.text_input("종목명 또는 종목코드 (ETF 포함)", placeholder="예: 삼성전자")
+        # 관심 종목에서 넘어온 타겟이 있으면 자동 채움
+        query_val = st.session_state.target_stock if st.session_state.target_stock else ""
+        query = col1.text_input("종목명 또는 종목코드 (ETF 포함)", value=query_val, placeholder="예: 삼성전자")
         submitted = col2.form_submit_button("종목 분석", use_container_width=True, type="primary")
 
     if not submitted and not query: st.stop()
@@ -286,8 +267,7 @@ if menu == "1. 종합 주식/ETF 분석":
     matches = listings[listings["Code"] == q.zfill(6)] if q.isdigit() else listings[listings["Name"].astype(str).str.contains(re.escape(q), case=False, na=False)]
     if matches.empty: st.error("종목을 찾지 못했습니다."); st.stop()
     
-    code = str(matches.iloc[0]["Code"]).zfill(6)
-    company = str(matches.iloc[0]["Name"])
+    code, company = str(matches.iloc[0]["Code"]).zfill(6), str(matches.iloc[0]["Name"])
     
     col_t1, col_t2 = st.columns([4, 1])
     col_t1.subheader(f"{company} ({code})")
@@ -357,34 +337,48 @@ if menu == "1. 종합 주식/ETF 분석":
         else: st.info(dart_err)
 
 # ==========================================
-# 2. 관심 종목 (즐겨찾기)
+# 2. 관심 종목 (즐겨찾기) - 원클릭 연동 구현
 # ==========================================
-elif menu == "2. ⭐ 관심 종목 (즐겨찾기)":
+elif st.session_state.current_menu == "2. ⭐ 관심 종목 (즐겨찾기)":
     st.title("⭐ 나의 관심 종목 리스트")
     favs = st.session_state["favorites"]
-    if not favs: st.info("등록된 관심 종목이 없습니다.")
+    if not favs: 
+        st.info("등록된 관심 종목이 없습니다. 종합 분석기에서 등록해 보세요.")
     else:
-        fav_rows = listings[listings["Code"].isin(favs)]
-        cards_data = []
-        for _, r in fav_rows.iterrows():
-            c_code, c_name = r["Code"], r["Name"]
-            p_df = load_price(c_code, (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"))
-            if p_df is not None and not p_df.empty:
-                last_c = p_df["Close"].iloc[-1]
-                prev_c = p_df["Close"].iloc[-2] if len(p_df) > 1 else last_c
-                chg = (last_c / prev_c - 1) * 100
-                vol = p_df["Volume"].iloc[-1] if "Volume" in p_df.columns else 0
-                tr = get_investor_trends_detail(c_code)
-                cards_data.append({
-                    "종목명": c_name, "현재가": f"{last_c:,.0f}원", "등락률": f"{chg:+.2f}%",
-                    "거래량": f"{vol:,.0f}주", "외국인(당일)": f"{tr['외국인_1일']:+,.0f}주", "기관(당일)": f"{tr['기관_1일']:+,.0f}주"
-                })
-        if cards_data: st.dataframe(pd.DataFrame(cards_data), use_container_width=True, hide_index=True)
+        for fav in favs:
+            hit = listings[listings["Code"] == fav]
+            if hit.empty: continue
+            c_name = hit.iloc[0]["Name"]
+            
+            with st.container():
+                c1, c2, c3, c4, c5 = st.columns([1.5, 1.5, 1.5, 1.5, 1.5])
+                c1.markdown(f"#### {c_name}\n`{fav}`")
+                
+                p_df = load_price(fav, (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"))
+                if p_df is not None and not p_df.empty:
+                    last_c = p_df["Close"].iloc[-1]
+                    prev_c = p_df["Close"].iloc[-2] if len(p_df) > 1 else last_c
+                    chg = (last_c / prev_c - 1) * 100
+                    c2.metric("현재가", f"{last_c:,.0f}원", f"{chg:+.2f}%")
+                    
+                    tr = get_investor_trends_detail(fav)
+                    c3.metric("외국인(당일)", f"{tr['외국인_1일']:+,.0f}주")
+                    c4.metric("기관(당일)", f"{tr['기관_1일']:+,.0f}주")
+                else:
+                    c2.write("데이터 없음"); c3.write("-"); c4.write("-")
+                
+                # 분석 화면 바로가기 버튼
+                st.markdown("<br>", unsafe_allow_html=True)
+                if c5.button("➡️ 분석화면 이동", key=f"btn_{fav}", use_container_width=True):
+                    st.session_state.current_menu = "1. 종합 주식/ETF 분석"
+                    st.session_state.target_stock = fav
+                    st.rerun()
+            st.divider()
 
 # ==========================================
-# 3, 4, 5. 기존과 동일한 스크리닝 기능들
+# 3, 4, 5. 스크리닝 기능들 (주도주 속도 3배 개선)
 # ==========================================
-elif menu == "3. 🔥 시가총액 상위 20 수급 동향":
+elif st.session_state.current_menu == "3. 🔥 시가총액 상위 20 수급 동향":
     st.title("🔥 시장별 시가총액 상위 20종목 수급 점검")
     market_c = st.selectbox("시장 선택", ["KOSPI", "KOSDAQ"])
     if st.button("수급 및 시세 조회", type="primary"):
@@ -399,7 +393,7 @@ elif menu == "3. 🔥 시가총액 상위 20 수급 동향":
                 rows.append({"순위": len(rows) + 1, "종목명": r['Name'], "현재가": f"{close_p:,.0f}원", "외국인(5일 합계)": f"{tr['외국인_5일']:+,.0f}주", "기관(5일 합계)": f"{tr['기관_5일']:+,.0f}주"})
             st.dataframe(pd.DataFrame(rows).set_index("순위"), use_container_width=True)
 
-elif menu == "4. 🚀 당일 상승률 상위 20":
+elif st.session_state.current_menu == "4. 🚀 당일 상승률 상위 20":
     st.title("🚀 시장별 상승률 상위 20 종목")
     market_g = st.selectbox("시장 구분", ["KOSPI", "KOSDAQ"])
     if st.button("상승률 상위 조회", type="primary"):
@@ -414,13 +408,17 @@ elif menu == "4. 🚀 당일 상승률 상위 20":
                 st.dataframe(pd.DataFrame(rows_g).set_index("순위"), use_container_width=True)
             else: st.error("현재 시간 기준 등락률 데이터를 불러올 수 없습니다.")
 
-elif menu == "5. 💡 AI 추천 종목 스크리닝":
+elif st.session_state.current_menu == "5. 💡 AI 추천 종목 스크리닝":
     st.title("💡 조건검색: 주도주 탐색")
-    if st.button("스크리닝 시작", type="primary"):
+    st.caption("속도 최적화를 위해 당일 거래량 최상위 **30개 주도주** 내에서만 정밀 스크리닝을 진행합니다.")
+    if st.button("스크리닝 시작 (초고속 모드)", type="primary"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         df_k = listings[(listings['시장'].isin(['KOSPI', 'KOSDAQ'])) & (~listings['Name'].str.contains("KODEX|TIGER|KBSTAR", na=False))]
-        df_top = df_k.sort_values('Volume', ascending=False).head(100) if 'Volume' in df_k.columns else df_k.head(100)
+        
+        # 탐색 범위를 100개에서 30개로 대폭 줄여 속도 3배 향상
+        df_top = df_k.sort_values('Volume', ascending=False).head(30) if 'Volume' in df_k.columns else df_k.head(30)
+        
         recom_res = []
         for i, (_, r) in enumerate(df_top.iterrows()):
             status_text.text(f"분석 중... ({r['Name']})")
@@ -441,7 +439,7 @@ elif menu == "5. 💡 AI 추천 종목 스크리닝":
 # ==========================================
 # 6. 정밀 기술적 보조지표 차트
 # ==========================================
-elif menu == "6. 📉 HTS급 보조지표 차트":
+elif st.session_state.current_menu == "6. 📉 HTS급 보조지표 차트":
     st.title("📉 HTS급 정밀 기술적 분석 차트")
     st.markdown("**(캔들 차트 + 볼린저 밴드 + 피보나치 되돌림 + RSI 지표)**")
     
@@ -450,11 +448,9 @@ elif menu == "6. 📉 HTS급 보조지표 차트":
     
     if not t_match.empty:
         t_code = str(t_match.iloc[0]["Code"]).zfill(6)
-        t_name = t_match.iloc[0]["Name"]
         
         df_p = load_price(t_code, (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"))
         if df_p is not None and not df_p.empty:
-            
             df_p["MA20"] = df_p["Close"].rolling(20).mean()
             df_p["STD"] = df_p["Close"].rolling(20).std()
             df_p["Upper"] = df_p["MA20"] + (df_p["STD"] * 2)

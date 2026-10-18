@@ -260,7 +260,6 @@ def get_news(company):
             p = sum(k in title.lower() for k in ["흑자", "상승", "급등", "수주", "계약", "호실적", "배당"])
             n = sum(k in title.lower() for k in ["적자", "하락", "급락", "소송", "횡령", "유상증자", "부진"])
             
-            # 여기서 긴 코드를 줄바꿈하여 잘림 방지
             pub_date = item.findtext("pubDate") or ""
             source = item.findtext("source") or ""
             link = item.findtext("link") or ""
@@ -278,30 +277,37 @@ def get_news(company):
         return pd.DataFrame()
 
 # ==========================================
-# 증권사 리포트 & 투자의견 추출 함수
+# 증권사 리포트 & 투자의견 추출 함수 (초고속 파싱으로 프리징 완전 차단)
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_analyst_reports(code):
     url = f"https://finance.naver.com/research/company_list.naver?searchType=itemCode&itemCode={code}"
     try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
         html = r.content.decode('euc-kr', 'replace')
         
-        row_pattern = r'<tr>(.*?)</tr>'
-        td_pattern = r'<td.*?>(.*?)</td>'
-        
-        rows = re.findall(row_pattern, html, re.DOTALL | re.IGNORECASE)
+        # 무한루프를 일으키던 정규식을 빼고, 안전하고 빠른 문자열 자르기(split) 적용
+        table_start = html.find('<table class="type1">')
+        table_end = html.find('</table>', table_start)
+        if table_start != -1 and table_end != -1:
+            html = html[table_start:table_end]
+            
+        def clean_html(raw):
+            return re.sub(r'<[^>]+>', '', raw).strip()
+            
         reports = []
-        for row in rows:
-            tds = re.findall(td_pattern, row, re.DOTALL | re.IGNORECASE)
-            if len(tds) >= 7:
-                title_match = re.search(r'<a[^>]*>(.*?)</a>', tds[2], re.IGNORECASE)
-                title = title_match.group(1).strip() if title_match else tds[2].strip()
+        rows = html.split('<tr>')
+        for row in rows[1:]:
+            tds = row.split('<td')
+            if len(tds) >= 8:
+                title_raw = '<td' + tds[3]
+                title_match = re.search(r'<a[^>]*>(.*?)</a>', title_raw, re.IGNORECASE)
+                title = title_match.group(1).strip() if title_match else clean_html(title_raw)
                 
-                price = re.sub(r'<[^>]+>', '', tds[3]).strip()
-                opinion = re.sub(r'<[^>]+>', '', tds[4]).strip()
-                firm = re.sub(r'<[^>]+>', '', tds[5]).strip()
-                date = re.sub(r'<[^>]+>', '', tds[6]).strip()
+                price = clean_html('<td' + tds[4])
+                opinion = clean_html('<td' + tds[5])
+                firm = clean_html('<td' + tds[6])
+                date = clean_html('<td' + tds[7])
                 
                 if title and opinion and opinion != "투자의견":
                     reports.append({
@@ -312,7 +318,7 @@ def get_analyst_reports(code):
                         "리포트 제목": title
                     })
         return pd.DataFrame(reports).head(5)
-    except:
+    except Exception:
         return pd.DataFrame()
 
 def won(v): return f"{float(v):,.0f}원" if pd.notna(v) else "자료 없음"
@@ -323,7 +329,7 @@ if listings.empty:
     st.stop()
 
 # ==========================================
-# 1. 종합 주식/ETF 분석
+# 1. 종합 주식/ETF 분석 (모든 구역에 에러 보호막 추가)
 # ==========================================
 if st.session_state.current_menu == "1. 종합 주식/ETF 분석":
     st.title("📈 국내 주식 및 ETF 종합 분석기")
@@ -354,18 +360,273 @@ if st.session_state.current_menu == "1. 종합 주식/ETF 분석":
             st.info("해제 완료.")
         save_favorites() 
 
-    # 뉴스
-    news_df = get_news(company)
+    # 뉴스 파트 (보호막 적용)
     st.markdown("### 🔔 핵심 뉴스 (호재/악재 자동 분류)")
-    if news_df is not None and not news_df.empty:
-        core_news = news_df[news_df["분류(자동)"] != "중립/추가 확인"]
-        if not core_news.empty:
-            for _, n in core_news.head(5).iterrows():
-                color = "red" if "호재" in n["분류(자동)"] else "blue"
-                st.markdown(f'**[{n["날짜"]}] {n["제목"]}** - <span style="color:{color}">{n["분류(자동)"]}</span>', unsafe_allow_html=True)
-                st.caption(f'{n["출처"]} | [기사 열람]({n["링크"]})')
-        else: st.info("최근 주요 호재/악재 뉴스가 없습니다.")
+    try:
+        news_df = get_news(company)
+        if news_df is not None and not news_df.empty:
+            core_news = news_df[news_df["분류(자동)"] != "중립/추가 확인"]
+            if not core_news.empty:
+                for _, n in core_news.head(5).iterrows():
+                    color = "red" if "호재" in n["분류(자동)"] else "blue"
+                    st.markdown(f'**[{n["날짜"]}] {n["제목"]}** - <span style="color:{color}">{n["분류(자동)"]}</span>', unsafe_allow_html=True)
+                    st.caption(f'{n["출처"]} | [기사 열람]({n["링크"]})')
+            else: st.info("최근 주요 호재/악재 뉴스가 없습니다.")
+        else:
+            st.info("최근 주요 뉴스가 없습니다.")
+    except Exception as e:
+        st.error(f"뉴스 데이터를 불러오는 중 일시적인 오류가 발생했습니다.")
         
-    # 증권사 리포트 파트
     st.divider()
+    
+    # 증권사 리포트 파트 (보호막 적용)
     st.markdown("### 📑 최근 증권사 리포트 및 투자의견")
+    try:
+        reports_df = get_analyst_reports(code)
+        if not reports_df.empty:
+            opinions = reports_df['투자의견'].tolist()
+            buy_count = sum(1 for o in opinions if '매수' in o or 'Buy' in o or 'buy' in o.lower())
+            
+            st.caption(f"🎯 최근 5개 리포트 중 **매수(Buy) 의견: {buy_count}곳**")
+            st.dataframe(reports_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("최근 발행된 증권사 리포트가 없습니다. (ETF, 소형주 등)")
+    except Exception as e:
+        st.error(f"리포트 데이터를 분석하는 중 일시적인 오류가 발생했습니다.")
+        
+    st.divider()
+
+    # 차트 파트 (보호막 적용)
+    try:
+        prices = load_price(code, (datetime.now() - timedelta(days=370)).strftime("%Y-%m-%d"), (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"))
+        if prices is not None and not prices.empty:
+            close = prices["Close"].dropna()
+            c_price = float(close.iloc[-1])
+            change = (c_price / float(close.iloc[0]) - 1) * 100
+            
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("최근 종가", won(c_price))
+            m2.metric("조회 구간 등락률", f'{change:+.2f}%')
+            tr = get_investor_trends_detail(code)
+            m3.metric("기관 순매수 (최근 1일)", f"{tr['기관_1일']:+,.0f} 주")
+            m4.metric("외국인 순매수 (최근 1일)", f"{tr['외국인_1일']:+,.0f} 주")
+
+            df = prices.copy()
+            df["MA20"] = df["Close"].rolling(20).mean()
+            df["MA60"] = df["Close"].rolling(60).mean()
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.04, row_heights=[0.72, 0.28])
+            fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="주가"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["MA20"], name="20일선"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df["MA60"], name="60일선"), row=1, col=1)
+            if "Volume" in df.columns: 
+                fig.add_trace(go.Bar(x=df.index, y=df["Volume"], name="거래량"), row=2, col=1)
+            fig.update_layout(height=400, margin=dict(t=10, b=10), xaxis_rangeslider_visible=False)
+            st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"주가 차트를 그리는 중 일시적인 오류가 발생했습니다.")
+
+    # DART 파트 (보호막 적용)
+    st.divider()
+    col_fin, col_dart = st.columns(2)
+    with col_fin:
+        st.markdown("### 📊 최근 실적/재무 (OpenDART)")
+        try:
+            dart_fin, fin_info = get_dart_financials(code, dart_key)
+            if dart_fin is not None and isinstance(dart_fin, pd.DataFrame):
+                st.dataframe(dart_fin, use_container_width=True, hide_index=True)
+                st.caption(f"출처: 금융감독원 OpenDART ({fin_info})")
+            else: 
+                st.info(fin_info)
+        except Exception as e:
+            st.error(f"재무 정보를 불러오는 중 오류가 발생했습니다.")
+            
+    with col_dart:
+        st.markdown("### 📜 최근 주요 공시")
+        try:
+            dart_disc, dart_err = get_recent_disclosures(code, dart_key)
+            if dart_disc is not None and not dart_disc.empty:
+                for _, d in dart_disc.iterrows():
+                    st.markdown(f"- **{d['rcept_dt']}** : [{d['report_nm']}]({d['link']})")
+            else: 
+                st.info(dart_err)
+        except Exception as e:
+            st.error(f"공시 정보를 불러오는 중 오류가 발생했습니다.")
+
+# ==========================================
+# 2. 관심 종목 (즐겨찾기)
+# ==========================================
+elif st.session_state.current_menu == "2. ⭐ 관심 종목 (즐겨찾기)":
+    st.title("⭐ 나의 관심 종목 리스트")
+    favs = st.session_state["favorites"]
+    if not favs: 
+        st.info("등록된 관심 종목이 없습니다. 종합 분석기에서 등록해 보세요.")
+    else:
+        for fav in favs:
+            hit = listings[listings["Code"] == fav]
+            if hit.empty: continue
+            c_name = hit.iloc[0]["Name"]
+            
+            with st.container():
+                c1, c2, c3, c4, c5 = st.columns([1.5, 1.5, 1.5, 1.5, 1.5])
+                c1.markdown(f"#### {c_name}\n`{fav}`")
+                
+                p_df = load_price(fav, (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"))
+                if p_df is not None and not p_df.empty:
+                    last_c = p_df["Close"].iloc[-1]
+                    prev_c = p_df["Close"].iloc[-2] if len(p_df) > 1 else last_c
+                    chg = (last_c / prev_c - 1) * 100
+                    c2.metric("현재가", f"{last_c:,.0f}원", f"{chg:+.2f}%")
+                    
+                    tr = get_investor_trends_detail(fav)
+                    c3.metric("외국인(당일)", f"{tr['외국인_1일']:+,.0f}주")
+                    c4.metric("기관(당일)", f"{tr['기관_1일']:+,.0f}주")
+                else:
+                    c2.write("데이터 없음"); c3.write("-"); c4.write("-")
+                
+                st.markdown("<br>", unsafe_allow_html=True)
+                if c5.button("➡️ 분석화면 이동", key=f"btn_{fav}", use_container_width=True):
+                    st.session_state.current_menu = "1. 종합 주식/ETF 분석"
+                    st.session_state.target_stock = fav
+                    st.rerun()
+            st.divider()
+
+# ==========================================
+# 3, 4, 5. 스크리닝 기능들
+# ==========================================
+elif st.session_state.current_menu == "3. 🔥 시가총액 상위 20 수급 동향":
+    st.title("🔥 시장별 시가총액 상위 20종목 수급 점검")
+    market_c = st.selectbox("시장 선택", ["KOSPI", "KOSDAQ"])
+    if st.button("수급 및 시세 조회", type="primary"):
+        with st.spinner("데이터 분석 중입니다..."):
+            df_m = listings[listings['시장'] == market_c].copy()
+            top20 = df_m.sort_values("Marcap", ascending=False).head(20) if 'Marcap' in df_m.columns else df_m.head(20)
+            rows = []
+            for i, r in top20.iterrows():
+                p_df = load_price(r['Code'], (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"))
+                close_p = p_df['Close'].iloc[-1] if p_df is not None and not p_df.empty else 0
+                tr = get_investor_trends_detail(r['Code'])
+                rows.append({
+                    "순위": len(rows) + 1, 
+                    "종목명": r['Name'], 
+                    "현재가": f"{close_p:,.0f}원", 
+                    "외국인(5일 합계)": f"{tr['외국인_5일']:+,.0f}주", 
+                    "기관(5일 합계)": f"{tr['기관_5일']:+,.0f}주"
+                })
+            st.dataframe(pd.DataFrame(rows).set_index("순위"), use_container_width=True)
+
+elif st.session_state.current_menu == "4. 🚀 당일 상승률 상위 20":
+    st.title("🚀 시장별 상승률 상위 20 종목")
+    market_g = st.selectbox("시장 구분", ["KOSPI", "KOSDAQ"])
+    if st.button("상승률 상위 조회", type="primary"):
+        with st.spinner("시장 데이터 집계 중..."):
+            df_krx = listings[listings['시장'] == market_g].copy()
+            if 'ChagesRatio' in df_krx.columns:
+                top20_g = df_krx.sort_values("ChagesRatio", ascending=False).head(20)
+                rows_g = []
+                for _, r in top20_g.iterrows():
+                    tr = get_investor_trends_detail(r['Code'])
+                    rows_g.append({
+                        "순위": len(rows_g) + 1, 
+                        "종목명": r['Name'], 
+                        "상승률": f"{r['ChagesRatio']:+.2f}%", 
+                        "종가": f"{r['Close']:,.0f}원", 
+                        "거래량": f"{r['Volume']:,.0f}주", 
+                        "외국인(당일)": f"{tr['외국인_1일']:+,.0f}주", 
+                        "기관(당일)": f"{tr['기관_1일']:+,.0f}주"
+                    })
+                st.dataframe(pd.DataFrame(rows_g).set_index("순위"), use_container_width=True)
+            else: 
+                st.error("현재 시간 기준 등락률 데이터를 불러올 수 없습니다.")
+
+elif st.session_state.current_menu == "5. 💡 AI 추천 종목 스크리닝":
+    st.title("💡 조건검색: 주도주 탐색")
+    st.caption("속도 최적화를 위해 당일 거래량 최상위 **30개 주도주** 내에서만 정밀 스크리닝을 진행합니다.")
+    if st.button("스크리닝 시작 (초고속 모드)", type="primary"):
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        df_k = listings[(listings['시장'].isin(['KOSPI', 'KOSDAQ'])) & (~listings['Name'].str.contains("KODEX|TIGER|KBSTAR", na=False))]
+        
+        df_top = df_k.sort_values('Volume', ascending=False).head(30) if 'Volume' in df_k.columns else df_k.head(30)
+        
+        recom_res = []
+        for i, (_, r) in enumerate(df_top.iterrows()):
+            status_text.text(f"분석 중... ({r['Name']})")
+            pdf = load_price(r['Code'], (datetime.now() - timedelta(days=50)).strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"))
+            if pdf is not None and len(pdf) >= 20:
+                close = pdf['Close'].iloc[-1]
+                ma5 = pdf['Close'].rolling(5).mean().iloc[-1]
+                ma20 = pdf['Close'].rolling(20).mean().iloc[-1]
+                
+                if close > ma5 and close > ma20:
+                    vol = pdf['Volume'].iloc[-1]
+                    prev_vol_avg = pdf['Volume'].iloc[-6:-1].mean()
+                    
+                    if prev_vol_avg > 0 and vol >= (prev_vol_avg * 2.0):
+                        tr = get_investor_trends_detail(r['Code'])
+                        if tr['기관_1일'] > 0 or tr['외국인_1일'] > 0:
+                            recom_res.append({
+                                "종목명": r['Name'], 
+                                "현재가": f"{close:,.0f}", 
+                                "거래량": f"{vol:,.0f}주", 
+                                "외국인(당일)": f"{tr['외국인_1일']:+,.0f}", 
+                                "기관(당일)": f"{tr['기관_1일']:+,.0f}"
+                            })
+            progress_bar.progress((i + 1) / len(df_top))
+        status_text.empty()
+        
+        if recom_res: 
+            st.dataframe(pd.DataFrame(recom_res), use_container_width=True, hide_index=True)
+        else: 
+            st.warning("조건을 완벽히 만족하는 종목이 없습니다.")
+
+# ==========================================
+# 6. 정밀 기술적 보조지표 차트
+# ==========================================
+elif st.session_state.current_menu == "6. 📉 HTS급 보조지표 차트":
+    st.title("📉 HTS급 정밀 기술적 분석 차트")
+    st.markdown("**(캔들 차트 + 볼린저 밴드 + 피보나치 되돌림 + RSI 지표)**")
+    
+    target = st.text_input("종목명 검색", value="삼성전자")
+    t_match = listings[listings["Code"] == target.zfill(6)] if target.isdigit() else listings[listings["Name"].astype(str).str.contains(re.escape(target), case=False, na=False)]
+    
+    if not t_match.empty:
+        t_code = str(t_match.iloc[0]["Code"]).zfill(6)
+        
+        df_p = load_price(t_code, (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"))
+        if df_p is not None and not df_p.empty:
+            df_p["MA20"] = df_p["Close"].rolling(20).mean()
+            df_p["STD"] = df_p["Close"].rolling(20).std()
+            df_p["Upper"] = df_p["MA20"] + (df_p["STD"] * 2)
+            df_p["Lower"] = df_p["MA20"] - (df_p["STD"] * 2)
+            
+            max_p, min_p = df_p['High'].max(), df_p['Low'].min()
+            diff = max_p - min_p
+            fib_levels = {
+                "0.0% (고점)": max_p, 
+                "23.6%": max_p - diff * 0.236, 
+                "38.2%": max_p - diff * 0.382, 
+                "50.0% (절반)": max_p - diff * 0.5, 
+                "61.8%": max_p - diff * 0.618, 
+                "100.0% (저점)": min_p
+            }
+            
+            delta = df_p["Close"].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            df_p["RSI"] = 100 - (100 / (1 + (gain / loss)))
+            
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05)
+            fig.add_trace(go.Candlestick(x=df_p.index, open=df_p['Open'], high=df_p['High'], low=df_p['Low'], close=df_p['Close'], name="주가"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df_p.index, y=df_p['Upper'], name="볼린저 상단", line=dict(color="rgba(173, 216, 230, 0.5)", dash="dash")), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df_p.index, y=df_p['Lower'], name="볼린저 하단", fill='tonexty', fillcolor="rgba(173, 216, 230, 0.1)", line=dict(color="rgba(173, 216, 230, 0.5)", dash="dash")), row=1, col=1)
+            
+            fib_colors = ["red", "orange", "yellow", "green", "blue", "purple"]
+            for i, (label, val) in enumerate(fib_levels.items()):
+                fig.add_hline(y=val, line_dash="dot", line_color=fib_colors[i], annotation_text=label, annotation_position="top left", row=1, col=1)
+            
+            fig.add_trace(go.Scatter(x=df_p.index, y=df_p['RSI'], name="RSI (14일)", line=dict(color="purple")), row=2, col=1)
+            fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="과매수 (70)", row=2, col=1)
+            fig.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="과매도 (30)", row=2, col=1)
+            
+            fig.update_layout(height=800, margin=dict(l=10, r=10, t=30, b=10), xaxis_rangeslider_visible=False, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
